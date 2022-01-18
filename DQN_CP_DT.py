@@ -1,3 +1,4 @@
+import gym
 import numpy as np
 import pydotplus
 import tensorflow as tf
@@ -8,99 +9,78 @@ from keras.utils import np_utils
 from ruleex import deepred
 from ruleex.deepred.model import DeepRedFCNet
 from sklearn import tree
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3 import DQN
 from tensorflow import keras
 
 import DR_helper_functions as gf
 
-CREATE_DRL_MODEL = True
+CREATE_MODEL = True
 CREATE_TREE = True
 CREATE_DNN = True
 TREE_DEPTH = 3
-NUMBER_ENVIRONMENTS = 8
-LOG_NAME = "PPO_CP_TENSORBOARD"
-ENVIRONMENT = make_vec_env("CartPole-v1", n_envs=NUMBER_ENVIRONMENTS)
+LOG_NAME = "DQN_CP_TENSORBOARD"
+ENVIRONMENT = gym.make("CartPole-v1")
 tf.compat.v1.disable_eager_execution()
 EPISODES = 100
 
 # ------------------------------------------------------------------------------------------------------------------
-# PROXIMAL POLICY OPTIMIZATION
+# DEEP Q-NETWORK ORACLE
 # ------------------------------------------------------------------------------------------------------------------
-env = make_vec_env("CartPole-v1", n_envs=8)
-PPO_CP_MODEL = PPO("MlpPolicy", env, n_steps=32, batch_size=256, gae_lambda=0.8, gamma=0.98, n_epochs=20, ent_coef=0.0,
-                   learning_rate=0.001, clip_range=0.2, verbose=1, tensorboard_log=f"./{LOG_NAME}/")
+policy_kwargs = dict(net_arch=[256, 256])
+DQN_CP_MODEL = DQN("MlpPolicy", ENVIRONMENT, policy_kwargs=policy_kwargs, learning_rate=0.001, batch_size=64,
+                   buffer_size=100000, learning_starts=500, target_update_interval=10, train_freq=256,
+                   gradient_steps=50, exploration_fraction=0.16, exploration_final_eps=0.04, verbose=1,
+                   tensorboard_log=f"./{LOG_NAME}/")
 
-if CREATE_DRL_MODEL:
-    PPO_CP_MODEL.learn(total_timesteps=int(1e5))
-    PPO_CP_MODEL.save("PPO_CP")
+if CREATE_MODEL:
+    DQN_CP_MODEL.learn(total_timesteps=int(5e4))
+    DQN_CP_MODEL.save("DQN_CP")
 else:
-    PPO_CP_MODEL = PPO.load("PPO_CP")
+    DQN_CP_MODEL = DQN.load("DQN_CP")
 
-PPO_OBSERVATIONS = []
-PPO_ACTIONS = []
+DQN_CP_REWARDS = []
+DQN_CP_OBSERVATIONS = []
+DQN_CP_ACTIONS = []
+DQN_CP_REWARD_EPISODE = 0
+CURRENT_EPISODE = 1
 
-episode_rewards = []
-episode_lengths = []
-
-episode_counts = np.zeros(NUMBER_ENVIRONMENTS, dtype="int")
-episode_count_targets = np.array([(EPISODES + i) // NUMBER_ENVIRONMENTS for i in range(NUMBER_ENVIRONMENTS)],
-                                 dtype="int")
-
-current_rewards = np.zeros(NUMBER_ENVIRONMENTS)
-current_lengths = np.zeros(NUMBER_ENVIRONMENTS, dtype="int")
-observations = ENVIRONMENT.reset()
-states = None
-while (episode_counts < episode_count_targets).any():
-    actions, states = PPO_CP_MODEL.predict(observations, state=states, deterministic=True)
-    PPO_OBSERVATIONS.append(observations)
-    PPO_ACTIONS.append(actions)
-    observations, rewards, dones, infos = ENVIRONMENT.step(actions)
-    current_rewards += rewards
-    current_lengths += 1
-    for i in range(NUMBER_ENVIRONMENTS):
-        if episode_counts[i] < episode_count_targets[i]:
-            if dones[i]:
-                episode_rewards.append(current_rewards[i])
-                episode_lengths.append(current_lengths[i])
-                episode_counts[i] += 1
-                current_rewards[i] = 0
-                current_lengths[i] = 0
-
-PPO_CP_REWARDS_MEAN = np.mean(episode_rewards)
-PPO_CP_REWARDS_STD = np.std(episode_rewards)
-
-print(f"Average Reward Oracle: {np.round(PPO_CP_REWARDS_MEAN, 2)} +/- {np.round(PPO_CP_REWARDS_STD, 2)}")
+obs = ENVIRONMENT.reset()
+while True:
+    action, states = DQN_CP_MODEL.predict(observation=obs, deterministic=True)
+    DQN_CP_OBSERVATIONS.append(obs)
+    DQN_CP_ACTIONS.append(action)
+    obs, reward, done, info = ENVIRONMENT.step(action)
+    DQN_CP_REWARD_EPISODE += reward
+    if done:
+        obs = ENVIRONMENT.reset()
+        DQN_CP_REWARDS.append(DQN_CP_REWARD_EPISODE)
+        CURRENT_EPISODE += 1
+        DQN_CP_REWARD_EPISODE = 0
+        if CURRENT_EPISODE > EPISODES:
+            break
+print(f"Average Reward Oracle: {np.round(np.mean(DQN_CP_REWARDS), 2)} +/- {np.round(np.std(DQN_CP_REWARDS), 2)}")
 
 # ------------------------------------------------------------------------------------------------------------------
 # Classification Tree
 # ------------------------------------------------------------------------------------------------------------------
-
-INPUT_TREE_X = []
-INPUT_TREE_Y = []
-
-for i in range(len(PPO_OBSERVATIONS)):
-    for j in range(NUMBER_ENVIRONMENTS):
-        INPUT_TREE_X.append(PPO_OBSERVATIONS[i][j])
-        INPUT_TREE_Y.append(PPO_ACTIONS[i][j])
+INPUT_TREE_X = DQN_CP_OBSERVATIONS
+INPUT_TREE_Y = DQN_CP_ACTIONS
 
 if CREATE_TREE:
     CLASSIFICATION_TREE = tree.DecisionTreeClassifier(max_depth=TREE_DEPTH)
     CLASSIFICATION_TREE.fit(X=INPUT_TREE_X, y=INPUT_TREE_Y)
-    dump(CLASSIFICATION_TREE, "PPO_CP_CLF")
+    dump(CLASSIFICATION_TREE, "DQN_CP_CLF")
 else:
-    CLASSIFICATION_TREE = load("PPO_CP_CLF")
+    CLASSIFICATION_TREE = load("DQN_CP_CLF")
 
 TREE_REWARDS = []
 TREE_REWARD_EPISODE = 0
 CURRENT_EPISODE = 1
 
-ENVIRONMENT = make_vec_env("CartPole-v1", n_envs=1)
 obs = ENVIRONMENT.reset()
-
 while True:
-    action = CLASSIFICATION_TREE.predict(obs)
-    obs, reward, done, info = ENVIRONMENT.step([action[0]])
+    action = CLASSIFICATION_TREE.predict(obs.reshape(1, -1))
+    obs, reward, done, info = ENVIRONMENT.step(action[0])
     TREE_REWARD_EPISODE += reward
     if done:
         obs = ENVIRONMENT.reset()
@@ -119,7 +99,7 @@ dot_data = tree.export_graphviz(CLASSIFICATION_TREE, out_file=None,
                                 filled=True)
 
 graph = pydotplus.graph_from_dot_data(dot_data)
-graph.write_png(f'PPO_CP_DT_{TREE_DEPTH}.png')
+graph.write_png(f'DQN_CP_DT_{TREE_DEPTH}.png')
 
 DT_text = tree.export_text(CLASSIFICATION_TREE, feature_names=["obs[0]", "obs[1]", "obs[2]", "obs[3]"])
 print(DT_text.replace('--- class:', 'return').replace('--- obs', 'if obs').replace('--- value: ', 'return ').
@@ -130,23 +110,23 @@ print(DT_text.replace('--- class:', 'return').replace('--- obs', 'if obs').repla
 # Deep Neural Network / DeepRED
 # ------------------------------------------------------------------------------------------------------------------
 
-x_train = np.array(INPUT_TREE_X)
-y_train = np.array(INPUT_TREE_Y)
+x_train = np.array(DQN_CP_OBSERVATIONS)
+y_train = np.array(DQN_CP_ACTIONS)
 y_train = np_utils.to_categorical(y_train, 2)
 
-PPO_CP_DNN = Sequential()
-PPO_CP_DNN.add(Dense(256, input_dim=4, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.add(Dense(256, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.add(Dense(2, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.compile(loss='categorical_crossentropy', optimizer=keras.optimizers.RMSprop(learning_rate=0.01),
+DQN_CP_DNN = Sequential()
+DQN_CP_DNN.add(Dense(256, input_dim=4, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+DQN_CP_DNN.add(Dense(256, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+DQN_CP_DNN.add(Dense(2, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+DQN_CP_DNN.compile(loss='categorical_crossentropy', optimizer=keras.optimizers.RMSprop(learning_rate=0.01),
                    metrics=['accuracy'])
 if CREATE_DNN:
-    history = PPO_CP_DNN.fit(x_train, y_train, batch_size=256, epochs=150)
-    accuracy = PPO_CP_DNN.evaluate(x_train, y_train, verbose=1)[1]
+    history = DQN_CP_DNN.fit(x_train, y_train, batch_size=256, epochs=200)
+    accuracy = DQN_CP_DNN.evaluate(x_train, y_train, verbose=1)[1]
     print("Training accuracy: " + str(accuracy * 100) + "%")
-    PPO_CP_DNN.save('PPO_CP_DNN')
+    DQN_CP_DNN.save('DQN_CP_DNN')
 else:
-    PPO_CP_DNN = keras.models.load_model('PPO_CP_DNN')
+    DQN_CP_DNN = keras.models.load_model('DQN_CP_DNN')
 
 DNN_REWARDS = []
 DNN_REWARD_EPISODE = 0
@@ -154,8 +134,8 @@ CURRENT_EPISODE = 1
 
 obs = ENVIRONMENT.reset()
 while True:
-    action = PPO_CP_DNN.predict(obs[0].reshape(1, -1))
-    obs, reward, done, info = ENVIRONMENT.step([np.argmax(action)])
+    action = DQN_CP_DNN.predict(obs.reshape(1, -1))
+    obs, reward, done, info = ENVIRONMENT.step(np.argmax(action))
     DNN_REWARD_EPISODE += reward
     if done:
         obs = ENVIRONMENT.reset()
@@ -167,7 +147,7 @@ while True:
 print(f"Average Reward DNN: {np.round(np.mean(DNN_REWARDS), 2)} +/- "
       f"{np.round(np.std(DNN_REWARDS), 2)}")
 
-weights = PPO_CP_DNN.get_weights()
+weights = DQN_CP_DNN.get_weights()
 weights = gf.reshape_weights(weights)
 layer_sizes = gf.get_layer_sizes(weights)
 deepred_net = DeepRedFCNet(layer_sizes)
@@ -184,7 +164,7 @@ gf.Ruletree_to_string(rule=rt.root, depth=0)
 y_DeepRED = rt.eval_all(x_train)
 correct = 0
 for i in range(len(y_DeepRED)):
-    if y_DeepRED[i] == INPUT_TREE_Y[i]:
+    if y_DeepRED[i] == DQN_CP_ACTIONS[i]:
         correct += 1
 print(f"DeepRED Accuracy: {(correct/len(y_DeepRED)) * 100}%")
 
@@ -194,8 +174,8 @@ CURRENT_EPISODE = 1
 
 obs = ENVIRONMENT.reset()
 while True:
-    action = rt.eval_one(obs[0])
-    obs, reward, done, info = ENVIRONMENT.step([list(action)[0]])
+    action = rt.eval_one(obs)
+    obs, reward, done, info = ENVIRONMENT.step(list(action)[0])
     DEEPRED_REWARD_EPISODE += reward
     if done:
         obs = ENVIRONMENT.reset()

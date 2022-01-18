@@ -1,44 +1,57 @@
-import numpy as np
 import pydotplus
+import numpy as np
+import torch as th
 import tensorflow as tf
+from sklearn import tree
+from ruleex import deepred
+from typing import Callable
+from tensorflow import keras
 from joblib import dump, load
 from keras.layers import Dense
-from keras.models import Sequential
-from keras.utils import np_utils
-from ruleex import deepred
-from ruleex.deepred.model import DeepRedFCNet
-from sklearn import tree
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from tensorflow import keras
-
 import DR_helper_functions as gf
+from keras.utils import np_utils
+from stable_baselines3 import A2C
+from keras.models import Sequential
+from ruleex.deepred.model import DeepRedFCNet
+from stable_baselines3.common.env_util import make_vec_env
 
-CREATE_DRL_MODEL = True
+CREATE_MODEL = True
 CREATE_TREE = True
 CREATE_DNN = True
 TREE_DEPTH = 3
 NUMBER_ENVIRONMENTS = 8
-LOG_NAME = "PPO_CP_TENSORBOARD"
+LOG_NAME = "A2C_CP_TENSORBOARD"
 ENVIRONMENT = make_vec_env("CartPole-v1", n_envs=NUMBER_ENVIRONMENTS)
 tf.compat.v1.disable_eager_execution()
 EPISODES = 100
 
-# ------------------------------------------------------------------------------------------------------------------
-# PROXIMAL POLICY OPTIMIZATION
-# ------------------------------------------------------------------------------------------------------------------
-env = make_vec_env("CartPole-v1", n_envs=8)
-PPO_CP_MODEL = PPO("MlpPolicy", env, n_steps=32, batch_size=256, gae_lambda=0.8, gamma=0.98, n_epochs=20, ent_coef=0.0,
-                   learning_rate=0.001, clip_range=0.2, verbose=1, tensorboard_log=f"./{LOG_NAME}/")
 
-if CREATE_DRL_MODEL:
-    PPO_CP_MODEL.learn(total_timesteps=int(1e5))
-    PPO_CP_MODEL.save("PPO_CP")
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+
+    return func
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Advantage Actor Critic
+# ------------------------------------------------------------------------------------------------------------------
+
+policy_kwargs = dict(ortho_init=False, activation_fn=th.nn.ReLU, net_arch=[dict(pi=[128, 128], vf=[128, 128])])
+
+A2C_CP_MODEL = A2C("MlpPolicy", ENVIRONMENT, policy_kwargs=policy_kwargs, gamma=0.999, normalize_advantage=True,
+                   max_grad_norm=0.6, use_rms_prop=True, gae_lambda=0.98, n_steps=64,
+                   learning_rate=linear_schedule(0.003479714650024201), ent_coef=1.2071544125414278e-06,
+                   vf_coef=0.15287763485632272, verbose=1, tensorboard_log=f"./{LOG_NAME}/")
+
+if CREATE_MODEL:
+    A2C_CP_MODEL.learn(total_timesteps=int(5e5))
+    A2C_CP_MODEL.save("A2C_CP")
 else:
-    PPO_CP_MODEL = PPO.load("PPO_CP")
+    A2C_CP_MODEL = A2C.load("A2C_CP")
 
-PPO_OBSERVATIONS = []
-PPO_ACTIONS = []
+A2C_OBSERVATIONS = []
+A2C_ACTIONS = []
 
 episode_rewards = []
 episode_lengths = []
@@ -52,9 +65,9 @@ current_lengths = np.zeros(NUMBER_ENVIRONMENTS, dtype="int")
 observations = ENVIRONMENT.reset()
 states = None
 while (episode_counts < episode_count_targets).any():
-    actions, states = PPO_CP_MODEL.predict(observations, state=states, deterministic=True)
-    PPO_OBSERVATIONS.append(observations)
-    PPO_ACTIONS.append(actions)
+    actions, states = A2C_CP_MODEL.predict(observations, state=states, deterministic=True)
+    A2C_OBSERVATIONS.append(observations)
+    A2C_ACTIONS.append(actions)
     observations, rewards, dones, infos = ENVIRONMENT.step(actions)
     current_rewards += rewards
     current_lengths += 1
@@ -67,10 +80,10 @@ while (episode_counts < episode_count_targets).any():
                 current_rewards[i] = 0
                 current_lengths[i] = 0
 
-PPO_CP_REWARDS_MEAN = np.mean(episode_rewards)
-PPO_CP_REWARDS_STD = np.std(episode_rewards)
+A2C_CP_REWARDS_MEAN = np.mean(episode_rewards)
+A2C_CP_REWARDS_STD = np.std(episode_rewards)
 
-print(f"Average Reward Oracle: {np.round(PPO_CP_REWARDS_MEAN, 2)} +/- {np.round(PPO_CP_REWARDS_STD, 2)}")
+print(f"Average Reward Oracle: {np.round(A2C_CP_REWARDS_MEAN, 2)} +/- {np.round(A2C_CP_REWARDS_STD, 2)}")
 
 # ------------------------------------------------------------------------------------------------------------------
 # Classification Tree
@@ -79,17 +92,17 @@ print(f"Average Reward Oracle: {np.round(PPO_CP_REWARDS_MEAN, 2)} +/- {np.round(
 INPUT_TREE_X = []
 INPUT_TREE_Y = []
 
-for i in range(len(PPO_OBSERVATIONS)):
+for i in range(len(A2C_OBSERVATIONS)):
     for j in range(NUMBER_ENVIRONMENTS):
-        INPUT_TREE_X.append(PPO_OBSERVATIONS[i][j])
-        INPUT_TREE_Y.append(PPO_ACTIONS[i][j])
+        INPUT_TREE_X.append(A2C_OBSERVATIONS[i][j])
+        INPUT_TREE_Y.append(A2C_ACTIONS[i][j])
 
 if CREATE_TREE:
     CLASSIFICATION_TREE = tree.DecisionTreeClassifier(max_depth=TREE_DEPTH)
     CLASSIFICATION_TREE.fit(X=INPUT_TREE_X, y=INPUT_TREE_Y)
-    dump(CLASSIFICATION_TREE, "PPO_CP_CLF")
+    dump(CLASSIFICATION_TREE, "A2C_CP_CLF")
 else:
-    CLASSIFICATION_TREE = load("PPO_CP_CLF")
+    CLASSIFICATION_TREE = load("A2C_CP_CLF")
 
 TREE_REWARDS = []
 TREE_REWARD_EPISODE = 0
@@ -97,9 +110,10 @@ CURRENT_EPISODE = 1
 
 ENVIRONMENT = make_vec_env("CartPole-v1", n_envs=1)
 obs = ENVIRONMENT.reset()
+EPISODES = 1
 
 while True:
-    action = CLASSIFICATION_TREE.predict(obs)
+    action = CLASSIFICATION_TREE.predict(obs[0].reshape(1, -1))
     obs, reward, done, info = ENVIRONMENT.step([action[0]])
     TREE_REWARD_EPISODE += reward
     if done:
@@ -119,7 +133,7 @@ dot_data = tree.export_graphviz(CLASSIFICATION_TREE, out_file=None,
                                 filled=True)
 
 graph = pydotplus.graph_from_dot_data(dot_data)
-graph.write_png(f'PPO_CP_DT_{TREE_DEPTH}.png')
+graph.write_png(f'A2C_CP_DT_{TREE_DEPTH}.png')
 
 DT_text = tree.export_text(CLASSIFICATION_TREE, feature_names=["obs[0]", "obs[1]", "obs[2]", "obs[3]"])
 print(DT_text.replace('--- class:', 'return').replace('--- obs', 'if obs').replace('--- value: ', 'return ').
@@ -134,19 +148,19 @@ x_train = np.array(INPUT_TREE_X)
 y_train = np.array(INPUT_TREE_Y)
 y_train = np_utils.to_categorical(y_train, 2)
 
-PPO_CP_DNN = Sequential()
-PPO_CP_DNN.add(Dense(256, input_dim=4, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.add(Dense(256, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.add(Dense(2, kernel_initializer='normal', activation='sigmoid', use_bias=True))
-PPO_CP_DNN.compile(loss='categorical_crossentropy', optimizer=keras.optimizers.RMSprop(learning_rate=0.01),
+A2C_CP_DNN = Sequential()
+A2C_CP_DNN.add(Dense(256, input_dim=4, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+A2C_CP_DNN.add(Dense(256, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+A2C_CP_DNN.add(Dense(2, kernel_initializer='normal', activation='sigmoid', use_bias=True))
+A2C_CP_DNN.compile(loss='categorical_crossentropy', optimizer=keras.optimizers.RMSprop(learning_rate=0.01),
                    metrics=['accuracy'])
 if CREATE_DNN:
-    history = PPO_CP_DNN.fit(x_train, y_train, batch_size=256, epochs=150)
-    accuracy = PPO_CP_DNN.evaluate(x_train, y_train, verbose=1)[1]
+    history = A2C_CP_DNN.fit(x_train, y_train, batch_size=256, epochs=150)
+    accuracy = A2C_CP_DNN.evaluate(x_train, y_train, verbose=1)[1]
     print("Training accuracy: " + str(accuracy * 100) + "%")
-    PPO_CP_DNN.save('PPO_CP_DNN')
+    A2C_CP_DNN.save('A2C_CP_DNN')
 else:
-    PPO_CP_DNN = keras.models.load_model('PPO_CP_DNN')
+    A2C_CP_DNN = keras.models.load_model('A2C_CP_DNN')
 
 DNN_REWARDS = []
 DNN_REWARD_EPISODE = 0
@@ -154,7 +168,7 @@ CURRENT_EPISODE = 1
 
 obs = ENVIRONMENT.reset()
 while True:
-    action = PPO_CP_DNN.predict(obs[0].reshape(1, -1))
+    action = A2C_CP_DNN.predict(obs[0].reshape(1, -1))
     obs, reward, done, info = ENVIRONMENT.step([np.argmax(action)])
     DNN_REWARD_EPISODE += reward
     if done:
@@ -167,7 +181,7 @@ while True:
 print(f"Average Reward DNN: {np.round(np.mean(DNN_REWARDS), 2)} +/- "
       f"{np.round(np.std(DNN_REWARDS), 2)}")
 
-weights = PPO_CP_DNN.get_weights()
+weights = A2C_CP_DNN.get_weights()
 weights = gf.reshape_weights(weights)
 layer_sizes = gf.get_layer_sizes(weights)
 deepred_net = DeepRedFCNet(layer_sizes)
@@ -186,7 +200,7 @@ correct = 0
 for i in range(len(y_DeepRED)):
     if y_DeepRED[i] == INPUT_TREE_Y[i]:
         correct += 1
-print(f"DeepRED Accuracy: {(correct/len(y_DeepRED)) * 100}%")
+print(f"DeepRED Accuracy: {(correct / len(y_DeepRED)) * 100}%")
 
 DEEPRED_REWARDS = []
 DEEPRED_REWARD_EPISODE = 0
